@@ -115,3 +115,128 @@
     (err ERR-NOT-FOUND)))
 
 
+
+
+;; ========== Public Functions ==========
+;; Create a new PayTag
+(define-public (create-pay-tag (amount uint) (expires-in uint) (memo (optional (string-ascii 256))))
+  (let ((new-id (+ (var-get last-id) u1))
+        (expiration-height (+ stacks-block-height expires-in))
+        (recipient tx-sender)) ;; Default recipient is sender, could be a parameter
+    (begin
+      ;; Validate inputs
+      (asserts! (> amount u0) (err ERR-INVALID-AMOUNT))
+      (asserts! (<= expires-in MAX-EXPIRATION-BLOCKS) (err ERR-MAX-EXPIRATION-EXCEEDED))
+
+      ;; Set new ID and add to map
+      (var-set last-id new-id)
+      (map-set pay-tags 
+        {id: new-id} 
+        {
+          creator: tx-sender,
+          recipient: recipient,
+          amount: amount,
+          created-at: stacks-block-height,
+          expires-at: expiration-height,
+          memo: memo,
+          state: STATE-PENDING,
+          payment-tx: none
+        })
+
+      ;; Add to creator's index - store result locally to discard it
+      (let ((creator-result (add-id-to-principal-list tx-sender new-id)))
+        ;; If recipient is different from creator, add to recipient's index too
+        (if (not (is-eq recipient tx-sender))
+            ;; Store the result locally, effectively discarding it
+            (let ((recipient-result (add-id-to-principal-list recipient new-id)))
+              true) ;; Both branches return bool
+            true))
+
+      ;; Emit event
+      (print {event: "pay-tag-created", id: new-id, creator: tx-sender, amount: amount})
+      (ok new-id))))
+
+
+
+;; Fulfill a PayTag (pay the recipient)
+(define-public (fulfill-pay-tag (id uint))
+  (let ((tag (unwrap! (map-get? pay-tags {id: id}) (err ERR-NOT-FOUND)))
+        ;; Add a placeholder for the transaction hash
+        (placeholder-tx-hash 0x))  ;; Empty byte buffer as placeholder
+    (begin
+      ;; Verify the tag is still pending
+      (asserts! (is-eq (get state tag) STATE-PENDING) (err ERR-NOT-PENDING))
+
+      ;; Verify the tag has not expired
+      (asserts! (< stacks-block-height (get expires-at tag)) (err ERR-EXPIRED))
+
+      ;; Transfer sBTC from sender to recipient
+      (try! (contract-call? SBTC-CONTRACT transfer 
+               (get amount tag) 
+               tx-sender 
+               (get recipient tag) 
+               none)) 
+
+      ;; If we get here, transfer succeeded
+      ;; Update tag state to paid
+      ;; Note: We're using a placeholder for the tx hash since we can't directly access tx-hash
+      (map-set pay-tags {id: id} 
+        (merge tag {
+          state: STATE-PAID,
+          payment-tx: none  ;; Setting to none since we can't access the actual tx hash
+        }))
+
+      ;; Emit payment event
+      (print {
+        event: "pay-tag-paid", 
+        id: id, 
+        from: tx-sender, 
+        to: (get recipient tag), 
+        amount: (get amount tag),
+        memo: (get memo tag)
+      })
+
+      (ok id)
+    )))
+
+;; Cancel a PayTag (creator only)
+(define-public (cancel-pay-tag (id uint))
+  (let ((tag (unwrap! (map-get? pay-tags {id: id}) (err ERR-NOT-FOUND))))
+    (begin
+      ;; Verify sender is the creator
+      (asserts! (is-eq tx-sender (get creator tag)) (err ERR-UNAUTHORIZED))
+
+      ;; Verify the tag is still pending
+      (asserts! (is-eq (get state tag) STATE-PENDING) (err ERR-NOT-PENDING))
+
+      ;; Update tag state to canceled
+      (map-set pay-tags {id: id} (merge tag {state: STATE-CANCELED}))
+
+      ;; Emit event
+      (print {event: "pay-tag-canceled", id: id, creator: tx-sender})
+      (ok id))))
+
+;; Mark a PayTag as expired (can be called by anyone, but only if actually expired)
+(define-public (mark-expired (id uint))
+  (let ((tag (unwrap! (map-get? pay-tags {id: id}) (err ERR-NOT-FOUND))))
+    (begin
+      ;; Verify the tag is still pending
+      (asserts! (is-eq (get state tag) STATE-PENDING) (err ERR-NOT-PENDING))
+
+      ;; Verify the tag has actually expired
+      (asserts! (is-expired (get expires-at tag)) (err u107))
+
+      ;; Update tag state to expired
+      (map-set pay-tags {id: id} (merge tag {state: STATE-EXPIRED}))
+
+      ;; Emit event
+      (print {event: "pay-tag-expired", id: id})
+      (ok id))))
+
+;; Batch function to get multiple tags (useful for UIs)
+(define-public (get-multiple-tags (ids (list 20 uint)))
+  (ok (map get-tag-or-none ids)))
+
+;; Helper for batch function
+(define-private (get-tag-or-none (id uint))
+  (map-get? pay-tags {id: id}))
